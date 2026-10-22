@@ -1,0 +1,177 @@
+# ============================================================
+# 个人 AI 助手配置
+# 修改本文件后重启程序生效（模型 enabled 开关支持热加载）
+# ============================================================
+
+server:
+  host: 127.0.0.1
+  port: 8010
+  # 出站代理：访问 OpenAI 等被墙服务时填本地代理地址（Clash 默认 7890）。
+  # 启动时自动注入 HTTP_PROXY/HTTPS_PROXY；留空则跟随系统环境变量。
+  # 注意：Python（openai/httpx）只读环境变量，不读 WinHTTP/IE 系统代理。
+  # 代理软件未启动时会自动跳过，不影响 DeepSeek/Kimi/智谱直连。
+  # 模型可单独覆盖：在 models 中该模型下加 proxy: direct（强制直连）
+  # 或 proxy: http://IP:端口（仅该模型走此代理）；不加则跟随本全局代理。
+  proxy: "http://127.0.0.1:7890"
+  no_proxy: "127.0.0.1,localhost,::1"
+
+# ---------- 网关安全（虚拟密钥 + 角色 + Redis 限流，见 design.md）----------
+# 密钥库后端二选一：不设 DATABASE_URL 用本地 SQLite（data/keys.db）；
+# 设 DATABASE_URL=postgresql://...?sslmode=require（Neon 免费版）用 Postgres（需 pip install asyncpg）。
+# 限流用 Redis：本地 redis://127.0.0.1:6379/0 或 Upstash 免费版 rediss://default:密码@host:6379（环境变量 REDIS_URL）。
+# 管理走 /admin/*（环境变量 ADMIN_TOKEN 保护），密钥只存 SHA-256。
+# 模型单价（price_input_usd / price_output_usd，USD/百万 tokens）填在下方 models 各模型下，0=不计费。
+
+# ---------- 模型配置（可配置任意数量）----------
+# api_key 支持直接填写，或用 ${环境变量名} 从 .env 读取
+models:
+  - name: deepseek-chat
+    provider: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    model_name: deepseek-chat
+    enabled: true
+    tier: light            # light=轻量款  flagship=旗舰款
+
+  - name: deepseek-v4.1-flash
+    provider: deepseek
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    model_name: deepseek-flash
+    enabled: true
+    tier: flagship         # API 名 deepseek-flash；新架构旗舰，超越 V4 Pro
+
+  - name: kimi-k2.6
+    provider: moonshot
+    base_url: https://api.moonshot.cn/v1
+    api_key: ${MOONSHOT_API_KEY}
+    model_name: kimi-k2.6
+    enabled: true
+    tier: light
+
+  - name: kimi-k3
+    provider: moonshot
+    base_url: https://api.moonshot.cn/v1
+    api_key: ${MOONSHOT_API_KEY}
+    model_name: kimi-k3
+    enabled: true
+    tier: flagship
+    # 模型级超时：K3 长提示词会生成大量推理+输出 tokens，官方 API 实测约 80 tok/s，
+    # 但高负载长尾（ITL P99 1.3s/Token、TTFT P99 80s）下 3~5 万 tokens 可能超过 10 分钟，
+    # 单独放宽到 30 分钟；其余模型仍走 call.timeout_seconds（600s）快速失败
+    timeout_seconds: 1800
+
+  - name: glm-4-flash
+    provider: zhipu
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: ${ZHIPU_API_KEY}
+    model_name: glm-4-flash
+    enabled: true
+    tier: light            # 也用作摘要生成模型（便宜快速）
+
+  - name: glm-5.3
+    provider: zhipu
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key: ${ZHIPU_API_KEY}
+    model_name: glm-5.3
+    enabled: true
+    tier: flagship
+
+  # ---------- OpenAI / Gemini（暂时停用：国内直连不可达且账号不可用，恢复时去掉注释即可）----------
+  # - name: gpt-4o-mini
+  #   provider: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ${OPENAI_API_KEY}
+  #   model_name: gpt-4o-mini
+  #   enabled: false
+  #   tier: light
+  #
+  # - name: gpt-6
+  #   provider: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ${OPENAI_API_KEY}
+  #   model_name: gpt-6
+  #   enabled: false
+  #   tier: flagship
+  #
+  # - name: Gemini 4 Argon
+  #   provider: gemini-4-argon
+  #   base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  #   # 沿用 .env 中已有的 Google key 变量（原 Gemini 3.8 Flash 的 key）
+  #   api_key: ${GEMINI_3_8_FLASH_API_KEY}
+  #   model_name: gemini-4-argon
+  #   enabled: false
+  #   tier: flagship
+
+# ---------- 调用策略 ----------
+call:
+  # CLI 默认并行调用的模型（多结果对比）
+  default_models: [deepseek-chat, kimi-k2.6, glm-4-flash]
+  # 单模型失败时的自动降级顺序（按顺序尝试，直到成功）
+  fallback_order: [deepseek-chat, kimi-k2.6, glm-4-flash]
+  # 单次请求默认超时（秒）。旗舰模型处理长提示词可能需要数分钟（实测 kimi-k3 长输入约 180s）
+  # 个别模型可在 models 中用 timeout_seconds 单独覆盖（如 kimi-k3=1800），不影响其它模型快速失败
+  timeout_seconds: 600
+  # 自定义模型组：CLI 用 /group <组名> 一键切换，API 的 models 字段也可直接传组名
+  model_groups:
+    旗舰组: [deepseek-v4.1-flash, kimi-k3, glm-5.3]
+    GLM: [glm-5.3]
+    deepseek: [deepseek-v4.1-flash]
+  # 四角色协作流水线（/collab <组名> 按主题启用，默认关闭保持并行模式）：
+  #   顾问=组内全体模型（输出结构化 JSON）→ 裁判=聚合共识/冲突/硬约束
+  #   → 主笔=唯一负责定稿 → 审计=只挑错不重写，阻断级问题回炉主笔修订
+  # 防自处理：裁判不聚合自己署名的分析；审计≠主笔；主笔≠裁判（2 模型组审计复用裁判时不给审计看共识）
+  # 角色默认定位（组内缺某角色模型时按组内顺序自动顺延）：
+  collab:
+    writer: deepseek-v4.1-flash      # 主笔：定稿质量优先，用新架构旗舰
+    aggregator: glm-5.3              # 裁判：结构化汇总稳定
+    auditor: kimi-k3                 # 审计：长上下文强推理，适合挑错
+    max_revision_rounds: 1           # 回炉修订上限（0=只审计不修订）
+
+# ---------- 对话管理 ----------
+conversation:
+  # 历史上下文最多保留的最近轮数（1 轮 = 用户 1 次 + 助手 1 次）（硬上限）
+  history_turns: 10
+  # 历史上下文 token 预算（粗估：字符数/1.5）：窗口按预算从最新轮向前累加，
+  # 短对话自动多带轮、长回复自动少带轮；预算内实际轮数不超过上面的硬上限
+  history_token_budget: 6000
+  # 发给某模型时，历史中「其它模型的回复」只保留前 N 字要点（多模型并行省 token）；
+  # 该模型自己的回复始终保留全文。0=完全不保留其它模型回复
+  other_model_snippet_chars: 500
+  # 每次上传前显示提示词 token 估算并等待确认（回车=发送 / n=取消并回滚输入）；
+  # 仅 CLI 生效，网关 API 调用不经过确认
+  confirm_before_send: true
+  # 超出窗口的旧对话用此模型生成摘要（建议用最便宜的模型）
+  summarize_model: glm-4-flash
+  # /insert 命令的固定来源文件：把要插入的回复内容写到这个文件，/insert 直接读取
+  insert_source: insert_source.md
+  # /summarize 命令使用的总结模型（投票统计+总结不需要深度推理，deepseek-chat 性价比更高）
+  decision_summary_model: deepseek-chat
+  # /profile 画像提炼 + 合并重写使用的模型（画像质量优先，用旗舰；与 summarize_model 解耦）
+  profile_model: deepseek-v4.1-flash
+  # /summarize 平票时的 provider 优先级（越靠前权重越高）
+  # 注意是 provider 名称（与 models[].provider 对应），不是模型名
+  provider_priority: [deepseek, zhipu, moonshot, openai, gemini-4-argon]
+
+# ---------- RAG 检索增强（默认关闭，改 true 一键开启）----------
+rag:
+  enabled: false
+  top_k: 3
+  # 本地中文嵌入模型，首次使用自动下载（约 100MB，数据不出境）
+  embedding_model: BAAI/bge-small-zh-v1.5
+  # 国内镜像，加速模型下载
+  hf_endpoint: https://hf-mirror.com
+  chunk_size: 800
+  chunk_overlap: 100
+
+# ---------- Token 预算 ----------
+limits:
+  # 预估 token 超过该阈值时打印预警（按 1 中文字≈1.5 token 粗估）
+  token_warning_threshold: 20000
+
+# ---------- 目录路径（相对项目根目录，一般无需修改）----------
+paths:
+  profile: profile
+  conversations: conversations
+  knowledge: knowledge
+  chroma_db: chroma_db

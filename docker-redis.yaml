@@ -1,0 +1,6 @@
+# docker-compose.yml —— 只给本地开发用，Render 部署不依赖它
+services:
+  redis:
+    image: redis:8-alpine
+    ports: ["6379:6379"]
+  # gateway 不在 compose 里，本地直接 uvicorn 跑，享受热重载

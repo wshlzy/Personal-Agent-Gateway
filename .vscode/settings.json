@@ -1,0 +1,16 @@
+{
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (.venv)": {
+      "path": "powershell.exe",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& 'D:\\AI integrate\\personal-ai-assistant\\.venv\\Scripts\\Activate.ps1'"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell (.venv)",
+  "python.defaultInterpreterPath": "D:\\AI integrate\\personal-ai-assistant\\.venv\\Scripts\\python.exe"
+}

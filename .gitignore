@@ -1,0 +1,21 @@
+# 密钥与环境配置（绝不进 Git，见 design.md 安全设计）
+.env
+*.db
+
+# 运行数据（密钥库、错误日志、对话、画像、知识库）
+data/*
+# 演示预置数据必须随仓库发布（Render 冷启动时导入）
+!data/demo/
+data/private/
+logs/
+conversations/
+profile/
+knowledge/
+gateway.db
+chroma_db/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
