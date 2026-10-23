@@ -4,7 +4,7 @@
 - /v1/admin/* 与 /v1/rag/build 视为管理端点，仅 admin 角色
 - /v1/chat/completions 会解析请求体中的 model/models（collab 时展开组），
   逐个做 user 角色的 allowed_models 授权检查
-- 成本记账：端点把当次成本写入 request.state.cost_usd，中间件在响应后落 Redis
+- 成本记账：端点把当次成本写入 request.state.cost_cny，中间件在响应后落 Redis
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from src.security.keys import KeyStore, authenticate, authorize
 from src.security.rate_limit import RateLimiter
 
 _ADMIN_PREFIXES = ("/v1/admin/", "/v1/rag/build")
+_EXEMPT_PATHS = ("/health", "/demo", "/demo/register", "/v1/models")
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
@@ -43,8 +44,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
-        # 豁免：健康检查、演示页直通；管理平面由 admin 路由自行保护
-        if path in ("/health", "/demo") or path.startswith("/admin/"):
+        # 豁免：健康检查、演示页、公开注册、admin 平面均直通
+        if path in _EXEMPT_PATHS or path.startswith("/admin/"):
             return await call_next(request)
 
         try:
@@ -72,8 +73,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         request.state.auth = ctx
         response = await call_next(request)
 
-        # ⑤ 记账：端点在 request.state.cost_usd 写入当次成本（USD）
-        cost = getattr(request.state, "cost_usd", 0.0)
+        # ⑤ 记账：端点把当次成本写入 request.state.cost_cny（人民币 CNY）
+        cost = getattr(request.state, "cost_cny", 0.0)
         if cost > 0:
             await self._rl().record_cost(ctx, float(cost))
         return response
@@ -84,9 +85,9 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         body = await request.body()
         request = self._rebuild_request(request, body)
         try:
-            text = body.decode("utf-8")
+            # utf-8-sig 自动吞掉 PowerShell 等写文件时带的 UTF-8 BOM（\xef\xbb\xbf）
+            text = body.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
-            # 常见于 Windows GBK 终端直接内联中文发 curl：明确拒绝而非 500
             raise ApiError(
                 400,
                 "请求体必须是 UTF-8 编码；Windows 终端建议把 JSON 存为 UTF-8 文件后用 curl -d @文件 发送",

@@ -14,9 +14,11 @@ POST /v1/chat/completions 内部链路：
 from __future__ import annotations
 
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -277,11 +279,13 @@ def _validate_model_names(names: list[str]) -> None:
     )
 
 
-def _cost_usd(model_name: str, tokens: int) -> float:
-    """按模型单价折算当次成本（USD）。
+def _cost_cny(model_name: str, tokens: int) -> float:
+    """按模型单价折算当次成本（人民币 CNY）。
 
     上游响应只有 total_tokens（无输入/输出拆分），取输入输出单价的平均值近似；
     模型未配置单价（=0）时成本为 0，不影响日预算。
+    价格字段 price_input_usd/price_output_usd 是模型实际计价单位（USD），
+    此处按 USD_TO_CNY 汇率（环境变量，默认 7.2）换算为人民币，与预算单位一致。
     """
     if tokens <= 0:
         return 0.0
@@ -289,8 +293,11 @@ def _cost_usd(model_name: str, tokens: int) -> float:
         m = state.config.get_model(model_name)
     except KeyError:
         return 0.0
-    avg_price = (m.price_input_usd + m.price_output_usd) / 2
-    return tokens / 1_000_000 * avg_price
+    avg_price_usd = (m.price_input_usd + m.price_output_usd) / 2
+    if avg_price_usd <= 0:
+        return 0.0
+    fx = float(os.environ.get("USD_TO_CNY", "7.2"))
+    return tokens / 1_000_000 * avg_price_usd * fx
 
 
 # ---------- 租户与上下文 ----------
@@ -449,17 +456,117 @@ async def demo_page(request: Request) -> str:
 互相不可见，也看不到演示预置数据。访客只能写入会话，不能写画像与知识库；
 数据不参与画像提炼，也不进入向量库。<strong>所有访客会话在写入 1 小时后
 被自动删除（TTL = 1 小时，惰性清理）</strong>，到期不可恢复。</p>
-<h2>获取访客密钥</h2>
-<p>由管理员调用 <code>POST /admin/keys</code>，请求体 <code>{{"guest": true}}</code>，
-返回的 <code>sk_live_...</code> 即访客密钥（仅返回一次）。</p>
+<h2>获取演示密钥（自助注册）</h2>
+<p>无需任何 token，公开自助注册：</p>
+<pre>curl -X POST {request.base_url}demo/register</pre>
+<p>返回 <code>sk_live_...</code>（<strong>明文仅此一次</strong>），固定参数：rpm=3、预算 ¥0.02、
+仅可调用 deepseek-v4.1-flash、glm-4-flash、24 小时后自动过期。防滥用：每 IP 每天 2 把、全局每天 50 把。</p>
+<p>也可由管理员调用 <code>POST /admin/keys</code> 配 <code>{{"guest": true}}</code> 签发访客密钥。</p>
 <h2>发起对话</h2>
 <pre>curl -X POST {request.base_url}v1/chat/completions \\
-  -H "Authorization: Bearer &lt;访客密钥&gt;" \\
+  -H "Authorization: Bearer &lt;演示密钥&gt;" \\
   -H "Content-Type: application/json" \\
-  -d '{{"model": "deepseek-chat", "messages": [{{"role": "user", "content": "你好"}}]}}'</pre>
+  -d '{{"model": "deepseek-v4.1-flash", "messages": [{{"role": "user", "content": "你好"}}]}}'</pre>
+<p>支持 <code>"collab": true</code> 开启四角色协作流水线（自动展开 deepseek-v4.1-flash + glm-4-flash）。</p>
 <p class="banner">{notice}</p>
 <p>可用模型：<a href="/v1/models">/v1/models</a>（需密钥）。</p>
 </body></html>"""
+
+
+# ---------- 公开自助注册（演示环境） ----------
+async def _demo_register_rate_limit(redis_client, ip: str) -> None:
+    """每 IP 每天最多 2 把；全局每天最多 50 把。fail-closed。"""
+    now_utc = datetime.now(timezone.utc)
+    day = now_utc.strftime("%Y%m%d")
+    seconds_to_midnight = int(
+        (
+            (now_utc + timedelta(days=1))
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            - now_utc
+        ).total_seconds()
+    ) + 60  # 多 60s 余量避免边界竞态
+
+    async def _check(key_label: str, key_val: str, limit: int) -> None:
+        key = f"register:{key_label}:{key_val}:{day}"
+        count = await redis_client.incr(key)
+        if count == 1:
+            await redis_client.expire(key, seconds_to_midnight)
+        if count > limit:
+            raise ApiError(
+                429,
+                "register_rate_limited",
+                retry_after=seconds_to_midnight,
+            )
+
+    await _check("ip", ip, 2)
+    await _check("total", "", 50)
+
+
+def _extract_client_ip(request: Request) -> str:
+    """取客户端 IP：优先 X-Forwarded-For 第一个，fallback client.host。"""
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+
+class DemoRegisterRequest(BaseModel):
+    name: str | None = None
+
+
+@app.post("/demo/register", status_code=201)
+async def demo_register(body: DemoRegisterRequest | None = None, request: Request = None):
+    """公开自助注册端点：无需鉴权。
+
+    防滥用：每 IP 每天 2 把、全局每天 50 把（Redis INCR+EXPIRE 原子操作）。
+    返回的 key 固定：role=user、allowed_models=["deepseek-v4.1-flash","glm-4-flash"]、
+    rpm=3、daily_budget_cny=0.02、expires_at=now()+24h。
+    """
+    # 惰性清理已过期的 keys（含上一批 demo register 创建的）
+    try:
+        await state.key_store.purge_expired()
+    except Exception:
+        pass  # 清理失败不阻断注册
+
+    # Redis 限流（fail-closed）
+    try:
+        await _demo_register_rate_limit(state.redis, _extract_client_ip(request))
+    except ApiError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": exc.detail,
+                "message": "演示注册配额用尽，请 24 小时后重试",
+            },
+            headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else None,
+        )
+    except Exception as exc:
+        # Redis 不可达：fail-closed，返回 503
+        raise HTTPException(status_code=503, detail=f"注册服务暂时不可用：{exc}")
+
+    expires_at = (datetime.now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    row, plaintext = await state.key_store.create_key(
+        role="user",
+        allowed_models="deepseek-v4.1-flash,glm-4-flash",
+        rpm_limit=3,
+        daily_budget_cny=0.02,
+        expires_at=expires_at,
+    )
+
+    result = {
+        "api_key": plaintext,
+        "rpm_limit": row["rpm_limit"],
+        "daily_budget_cny": row["daily_budget_cny"],
+        "allowed_models": ["deepseek-v4.1-flash", "glm-4-flash"],
+        "expires_at": row["expires_at"],
+        "notice": (
+            "演示密钥 24 小时后自动失效；仅可调用 deepseek-v4.1-flash、glm-4-flash；"
+            "演示输入仅保留 1 小时，请勿输入真实隐私信息。"
+        ),
+    }
+    if body and body.name:
+        result["name"] = body.name
+    return JSONResponse(result, status_code=201)
 
 
 @app.get("/v1/models")
@@ -608,7 +715,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             [(outcome.writer, outcome.final_content)],
         )
         # 成本记账（中间件在响应后读取并落 Redis）
-        request.state.cost_usd = _cost_usd(outcome.writer, outcome.tokens)
+        request.state.cost_cny = _cost_cny(outcome.writer, outcome.tokens)
         return JSONResponse(
             {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -678,7 +785,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             # 因此这里直接由生成器自行记账（不经过 request.state）。
             text_chars = sum(len(p) for p in full_text_parts)
             est_tokens = int(text_chars * 1.5)
-            cost = _cost_usd(model_names[0], est_tokens)
+            cost = _cost_cny(model_names[0], est_tokens)
             if cost > 0:
                 auth = getattr(request.state, "auth", None)
                 if auth is not None:
@@ -707,7 +814,7 @@ async def chat_completions(req: ChatRequest, request: Request):
     for i, r in enumerate(results):
         if r.ok:
             total_tokens += r.tokens
-            total_cost += _cost_usd(r.model, r.tokens)
+            total_cost += _cost_cny(r.model, r.tokens)
             choices.append(
                 {
                     "index": i,
@@ -719,7 +826,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             errors.append({"model": r.model, "error": r.error})
 
     # 成本记账（中间件在响应后读取并落 Redis）
-    request.state.cost_usd = total_cost
+    request.state.cost_cny = total_cost
 
     return JSONResponse(
         {
@@ -746,3 +853,4 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+

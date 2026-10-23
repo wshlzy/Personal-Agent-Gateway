@@ -174,7 +174,7 @@ async def test_invalid_tenant_id_rejected(store):
 def _ctx(tenant: str, role: str = "user") -> AuthContext:
     return AuthContext(
         key_id=f"key-{tenant}", tenant_id=tenant, role=role,
-        allowed_models=["*"], rpm_limit=60, daily_budget_usd=1.0,
+        allowed_models=["*"], rpm_limit=60, daily_budget_cny=1.0,
     )
 
 
@@ -200,3 +200,4 @@ def test_guest_write_profile_returns_403():
     assert exc.value.status_code == 403
     # 会话可写
     guard_write("guest-1234abcd", "conversation")
+

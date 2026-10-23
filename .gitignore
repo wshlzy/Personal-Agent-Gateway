@@ -14,6 +14,9 @@ knowledge/
 gateway.db
 chroma_db/
 
+# 临时测试请求体
+chat.json
+
 # Python
 .venv/
 __pycache__/

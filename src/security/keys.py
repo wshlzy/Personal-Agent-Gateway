@@ -32,9 +32,10 @@ CREATE TABLE IF NOT EXISTS keys (
   role             TEXT NOT NULL CHECK(role IN ('admin','user')),
   allowed_models   TEXT NOT NULL DEFAULT '*',
   rpm_limit        INTEGER NOT NULL DEFAULT 60,
-  daily_budget_usd REAL NOT NULL DEFAULT 1.0,
+  daily_budget_cny REAL NOT NULL DEFAULT 1.0,
   revoked_at       TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  expires_at       TEXT
 )
 """
 
@@ -47,15 +48,16 @@ CREATE TABLE IF NOT EXISTS keys (
   role             TEXT NOT NULL CHECK(role IN ('admin','user')),
   allowed_models   TEXT NOT NULL DEFAULT '*',
   rpm_limit        INTEGER NOT NULL DEFAULT 60,
-  daily_budget_usd DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+  daily_budget_cny DOUBLE PRECISION NOT NULL DEFAULT 1.0,
   revoked_at       TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  expires_at       TEXT
 )
 """
 
 _COLUMNS = (
-    "id, tenant_id, key_hash, role, allowed_models, rpm_limit, daily_budget_usd,"
-    " revoked_at, created_at"
+    "id, tenant_id, key_hash, role, allowed_models, rpm_limit, daily_budget_cny,"
+    " revoked_at, created_at, expires_at"
 )
 
 
@@ -74,14 +76,15 @@ class AuthContext:
     role: str                      # "admin" | "user"
     allowed_models: list[str] = field(default_factory=list)  # ["*"] 表示全部
     rpm_limit: int = 60
-    daily_budget_usd: float = 1.0
+    daily_budget_cny: float = 1.0  # 日预算（人民币元）
 
     def allows_model(self, model: str) -> bool:
         return "*" in self.allowed_models or model in self.allowed_models
 
 
 def _new_key_row(role: str, allowed_models: str, rpm_limit: int,
-                 daily_budget_usd: float, tenant_id: str | None = None) -> tuple[dict, str]:
+                 daily_budget_cny: float, tenant_id: str | None = None,
+                 expires_at: str | None = None) -> tuple[dict, str]:
     """两后端共用的建钥逻辑：返回 (记录, 明文)。"""
     if role not in ("admin", "user"):
         raise ValueError(f"role 只能是 admin/user，当前：{role}")
@@ -92,9 +95,10 @@ def _new_key_row(role: str, allowed_models: str, rpm_limit: int,
         "role": role,
         "allowed_models": allowed_models.strip() or "*",
         "rpm_limit": int(rpm_limit),
-        "daily_budget_usd": float(daily_budget_usd),
+        "daily_budget_cny": float(daily_budget_cny),
         "revoked_at": None,
         "created_at": datetime.now().isoformat(timespec="seconds"),
+        "expires_at": expires_at,
     }
     # tenant_id 未显式传入时默认等于 key.id（一 key 一租户）；显式传入可做一用户多 key
     from src.storage.base import validate_tenant_id
@@ -120,11 +124,15 @@ class KeyStore:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA_SQLITE)
-            # 存量库迁移：老版本没有 tenant_id 列，补列并回填为 key.id
+            # 存量库迁移：旧版本可能缺 tenant_id / expires_at，或 daily_budget_usd 旧列名
             cols = {r[1] for r in conn.execute("PRAGMA table_info(keys)")}
             if "tenant_id" not in cols:
                 conn.execute("ALTER TABLE keys ADD COLUMN tenant_id TEXT")
                 conn.execute("UPDATE keys SET tenant_id = id WHERE tenant_id IS NULL")
+            if "daily_budget_usd" in cols and "daily_budget_cny" not in cols:
+                conn.execute("ALTER TABLE keys RENAME COLUMN daily_budget_usd TO daily_budget_cny")
+            if "expires_at" not in cols:
+                conn.execute("ALTER TABLE keys ADD COLUMN expires_at TEXT")
             conn.commit()
 
     # ---------- 查询 ----------
@@ -139,8 +147,8 @@ class KeyStore:
         """管理端点列表用：不含 key_hash 本体。"""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, tenant_id, role, allowed_models, rpm_limit, daily_budget_usd,"
-                " revoked_at, created_at FROM keys ORDER BY created_at"
+                "SELECT id, tenant_id, role, allowed_models, rpm_limit, daily_budget_cny,"
+                " revoked_at, created_at, expires_at FROM keys ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -150,19 +158,20 @@ class KeyStore:
         role: str,
         allowed_models: str = "*",
         rpm_limit: int = 60,
-        daily_budget_usd: float = 1.0,
+        daily_budget_cny: float = 1.0,
         tenant_id: str | None = None,
+        expires_at: str | None = None,
     ) -> tuple[dict, str]:
         """创建密钥；返回 (记录, 明文)。明文仅此一次可得。"""
         row, plaintext = _new_key_row(
-            role, allowed_models, rpm_limit, daily_budget_usd, tenant_id
+            role, allowed_models, rpm_limit, daily_budget_cny, tenant_id, expires_at
         )
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO keys (id, tenant_id, key_hash, role, allowed_models, rpm_limit,"
-                " daily_budget_usd, revoked_at, created_at)"
+                " daily_budget_cny, revoked_at, created_at, expires_at)"
                 " VALUES (:id, :tenant_id, :key_hash, :role, :allowed_models, :rpm_limit,"
-                " :daily_budget_usd, :revoked_at, :created_at)",
+                " :daily_budget_cny, :revoked_at, :created_at, :expires_at)",
                 row,
             )
         return row, plaintext
@@ -183,6 +192,17 @@ class KeyStore:
 
     async def aclose(self) -> None:
         """统一关闭接口：SQLite 无长连接，空操作。"""
+
+    async def purge_expired(self) -> int:
+        """惰性清理已过期的 keys（expires_at 非空且早于当前时间），返回删除数量。"""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM keys WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            conn.commit()
+        return cur.rowcount
 
 
 # ---------- Postgres 后端（Neon 免费版，部署用） ----------
@@ -210,12 +230,21 @@ class PgKeyStore:
             )
             async with self._pool.acquire() as conn:
                 await conn.execute(_SCHEMA_PG)
-                # 存量库迁移：补 tenant_id 列并回填
+                # 存量库迁移：补 tenant_id / expires_at 列；daily_budget_usd 重命名为 cny
                 await conn.execute(
                     "ALTER TABLE keys ADD COLUMN IF NOT EXISTS tenant_id TEXT"
                 )
                 await conn.execute(
                     "UPDATE keys SET tenant_id = id WHERE tenant_id IS NULL"
+                )
+                try:
+                    await conn.execute(
+                        "ALTER TABLE keys RENAME COLUMN daily_budget_usd TO daily_budget_cny"
+                    )
+                except Exception:
+                    pass  # 已重命名（列不存在时 PG 抛错，忽略）
+                await conn.execute(
+                    "ALTER TABLE keys ADD COLUMN IF NOT EXISTS expires_at TEXT"
                 )
         return self._pool
 
@@ -231,8 +260,8 @@ class PgKeyStore:
         pool = await self._ensure_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, tenant_id, role, allowed_models, rpm_limit, daily_budget_usd,"
-                " revoked_at, created_at FROM keys ORDER BY created_at"
+                "SELECT id, tenant_id, role, allowed_models, rpm_limit, daily_budget_cny,"
+                " revoked_at, created_at, expires_at FROM keys ORDER BY created_at"
             )
         return [dict(r) for r in rows]
 
@@ -241,21 +270,22 @@ class PgKeyStore:
         role: str,
         allowed_models: str = "*",
         rpm_limit: int = 60,
-        daily_budget_usd: float = 1.0,
+        daily_budget_cny: float = 1.0,
         tenant_id: str | None = None,
+        expires_at: str | None = None,
     ) -> tuple[dict, str]:
         row, plaintext = _new_key_row(
-            role, allowed_models, rpm_limit, daily_budget_usd, tenant_id
+            role, allowed_models, rpm_limit, daily_budget_cny, tenant_id, expires_at
         )
         pool = await self._ensure_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO keys (id, tenant_id, key_hash, role, allowed_models, rpm_limit,"
-                " daily_budget_usd, revoked_at, created_at)"
-                " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                " daily_budget_cny, revoked_at, created_at, expires_at)"
+                " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 row["id"], row["tenant_id"], row["key_hash"], row["role"],
-                row["allowed_models"], row["rpm_limit"], row["daily_budget_usd"],
-                row["revoked_at"], row["created_at"],
+                row["allowed_models"], row["rpm_limit"], row["daily_budget_cny"],
+                row["revoked_at"], row["created_at"], row["expires_at"],
             )
         return row, plaintext
 
@@ -276,6 +306,18 @@ class PgKeyStore:
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    async def purge_expired(self) -> int:
+        pool = await self._ensure_pool()
+        now = datetime.now().isoformat(timespec="seconds")
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM keys WHERE expires_at IS NOT NULL AND expires_at < $1", now
+            )
+            await conn.execute(
+                "DELETE FROM keys WHERE expires_at IS NOT NULL AND expires_at < $1", now
+            )
+        return int(count or 0)
 
 
 def open_key_store(db_path: Path | str, database_url: str | None = None):
@@ -305,6 +347,17 @@ async def authenticate(authorization: str | None, store) -> AuthContext:
         raise ApiError(401, "API key 无效")
     if row["revoked_at"]:
         raise ApiError(401, "API key 已吊销")
+    # 过期检查：expires_at 非空且早于当前时间则拒绝
+    exp = row.get("expires_at")
+    if exp:
+        try:
+            exp_dt = datetime.fromisoformat(exp)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=None)  # naive：与 now() 比较
+            if exp_dt <= datetime.now():
+                raise ApiError(401, "API key 已过期")
+        except ValueError:
+            pass  # 非法格式忽略，不影响鉴权
     models = [m.strip() for m in row["allowed_models"].split(",") if m.strip()]
     return AuthContext(
         key_id=row["id"],
@@ -312,7 +365,7 @@ async def authenticate(authorization: str | None, store) -> AuthContext:
         role=row["role"],
         allowed_models=models or ["*"],
         rpm_limit=int(row["rpm_limit"]),
-        daily_budget_usd=float(row["daily_budget_usd"]),
+        daily_budget_cny=float(row["daily_budget_cny"]),
     )
 
 

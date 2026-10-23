@@ -1,4 +1,4 @@
-"""两维限流（Redis 原子计数）：RPM + 日预算（USD）。
+"""两维限流（Redis 原子计数）：RPM + 日预算（人民币 CNY）。
 
 键结构：
   ratelimit:{key_id}:{epoch_minute}   INCR 计数，TTL 70s
@@ -67,10 +67,10 @@ class RateLimiter:
             budget_key = f"budget:{ctx.key_id}:{_budget_day()}"
             spent_raw = await self._redis.get(budget_key)
             spent = float(spent_raw) if spent_raw else 0.0
-            if spent >= ctx.daily_budget_usd:
+            if spent >= ctx.daily_budget_cny:
                 raise ApiError(
                     429,
-                    f"已达当日预算上限（${ctx.daily_budget_usd:.4f}），明日重置",
+                    f"已达当日预算上限（¥{ctx.daily_budget_cny:.4f}），明日重置",
                     retry_after=_seconds_to_next_day(),
                 )
         except ApiError:
@@ -79,20 +79,20 @@ class RateLimiter:
             raise ApiError(503, f"限流服务不可用：{exc}") from exc
 
     # ---------- 成本记账（成功响应后） ----------
-    async def record_cost(self, ctx: AuthContext, cost_usd: float) -> None:
+    async def record_cost(self, ctx: AuthContext, cost_cny: float) -> None:
         """按 INCRBYFLOAT 累计当日花费；失败只打日志不阻塞。"""
-        if cost_usd <= 0:
+        if cost_cny <= 0:
             return
         try:
             budget_key = f"budget:{ctx.key_id}:{_budget_day()}"
-            await self._redis.incrbyfloat(budget_key, float(cost_usd))
+            await self._redis.incrbyfloat(budget_key, float(cost_cny))
             await self._redis.expire(budget_key, 48 * 3600)
         except Exception as exc:
-            print(f"  [记账失败，已跳过] key={ctx.key_id} cost=${cost_usd:.6f}：{exc}")
+            print(f"  [记账失败，已跳过] key={ctx.key_id} cost=¥{cost_cny:.6f}：{exc}")
 
     # ---------- 管理端点展示 ----------
     async def spent_today(self, key_id: str) -> float:
-        """返回该 key 当日已花费 USD；Redis 故障按 0 计。"""
+        """返回该 key 当日已花费 CNY；Redis 故障按 0 计。"""
         try:
             raw = await self._redis.get(f"budget:{key_id}:{_budget_day()}")
             return round(float(raw), 6) if raw else 0.0
